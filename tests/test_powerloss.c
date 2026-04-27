@@ -23,6 +23,10 @@ struct pl_stats {
     uint64_t cuts;
     uint64_t resolved_before;
     uint64_t resolved_after;
+    /* what the uninterrupted workloads did, i.e. what the cut points cover */
+    uint64_t gc_runs;
+    uint64_t wl_moves;
+    uint64_t erases;
 };
 
 static struct pl_stats totals;
@@ -87,9 +91,9 @@ static void run_with_cuts(const struct geom *g, const struct op *ops, int nops, 
         }
         i++;
 
-        if (cuts_left > 0 && rng_next(&rng) % 2 == 0) {
+        if (cuts_left > 0) {
             cuts_left--;
-            fkv_sim_cut_after(&e.sim, rng_next(&rng) % 60);
+            fkv_sim_cut_after(&e.sim, rng_next(&rng) % 300);
         }
     }
 
@@ -112,17 +116,31 @@ static uint64_t count_ops(const struct geom *g, const struct op *ops, int nops)
         model_apply(&m, &ops[i]);
     }
     uint64_t n = e.sim.ops - start;
+    struct fkv_stats st;
+    REQUIRE_OK(fkv_stat(&e.db, &st));
+    totals.gc_runs += st.gc_runs;
+    totals.wl_moves += st.wl_moves;
+    totals.erases += st.erases;
     env_free(&e);
     return n;
 }
 
-static void exhaustive(const struct geom *g, unsigned nkeys, int nops, int put_pct,
-                       int extra_cuts, uint64_t seed)
+/* Write every key once, then hammer a few hot ones: makes static wear
+ * leveling relocate the cold blocks, so those moves get cut too. */
+static void gen_hot_cold(struct op *ops, int n, unsigned nkeys, uint16_t max_val, uint64_t seed)
 {
-    static struct op ops[1000];
-    REQUIRE(nops <= 1000);
-    gen_ops(ops, nops, nkeys, (uint16_t)g->max_val, put_pct, seed);
+    gen_ops(ops, n, nkeys, max_val, 100, seed);
+    for (int i = 0; i < n; i++) {
+        if ((unsigned)i < nkeys)
+            ops[i].key = (uint8_t)i;
+        else
+            ops[i].key = (uint8_t)(rng_next(&seed) % 3);
+    }
+}
 
+static void exhaustive_ops(const struct geom *g, const struct op *ops, int nops, unsigned nkeys,
+                           int extra_cuts, uint64_t seed)
+{
     uint64_t total = count_ops(g, ops, nops);
     for (uint64_t k = 0; k < total; k++) {
         run_with_cuts(g, ops, nops, nkeys, k, extra_cuts, seed * 1000003u + k);
@@ -130,11 +148,33 @@ static void exhaustive(const struct geom *g, unsigned nkeys, int nops, int put_p
     }
 }
 
+static void exhaustive(const struct geom *g, unsigned nkeys, int nops, int put_pct,
+                       int extra_cuts, uint64_t seed)
+{
+    static struct op ops[2000];
+    REQUIRE(nops <= 2000);
+    gen_ops(ops, nops, nkeys, (uint16_t)g->max_val, put_pct, seed);
+    exhaustive_ops(g, ops, nops, nkeys, extra_cuts, seed);
+}
+
+static void exhaustive_hot_cold(const struct geom *g, unsigned nkeys, int nops, int extra_cuts,
+                                uint64_t seed)
+{
+    static struct op ops[2000];
+    REQUIRE(nops <= 2000);
+    gen_hot_cold(ops, nops, nkeys, (uint16_t)g->max_val, seed);
+    exhaustive_ops(g, ops, nops, nkeys, extra_cuts, seed);
+}
+
 static void report(const char *name)
 {
     printf("      %s: %llu cut points, %llu power cuts (%llu rolled back, %llu completed)\n",
            name, (unsigned long long)totals.cut_points, (unsigned long long)totals.cuts,
            (unsigned long long)totals.resolved_before, (unsigned long long)totals.resolved_after);
+    if (totals.erases)
+        printf("      workloads covered %llu compactions, %llu wear-leveling moves, %llu erases\n",
+               (unsigned long long)totals.gc_runs, (unsigned long long)totals.wl_moves,
+               (unsigned long long)totals.erases);
     memset(&totals, 0, sizeof totals);
 }
 
@@ -143,25 +183,42 @@ void test_powerloss_every_point(void)
     struct geom g = GEOM_SMALL;
     for (int policy = 0; policy < 2; policy++) {
         g.policy = (enum fkv_gc_policy)policy;
-        exhaustive(&g, 24, 250, 75, 0, 11 + (unsigned)policy);
+        exhaustive(&g, 24, 800, 75, 0, 11 + (unsigned)policy);
     }
     /* Byte-granular programming and a 3-block device: minimal slack. */
     g = GEOM_SMALL;
     g.prog_size = 1;
     g.block_count = 3;
-    exhaustive(&g, 6, 250, 75, 0, 21);
+    exhaustive(&g, 6, 800, 75, 0, 21);
+    /* Two blocks: every compaction uses the one and only spare. */
+    g = GEOM_SMALL;
+    g.block_count = 2;
+    exhaustive(&g, 3, 500, 75, 0, 22);
+    /* 16-byte program units (e.g. STM32 flash with ECC). */
+    g = (struct geom){256, 16, 16, 16, 32, 128, FKV_GC_COST_BENEFIT, 3};
+    exhaustive(&g, 24, 800, 75, 0, 23);
     /* Delete-heavy: exercises tombstone dropping during compaction. */
     g = GEOM_SMALL;
-    exhaustive(&g, 24, 250, 45, 0, 31);
+    exhaustive(&g, 24, 800, 45, 0, 31);
+    /* Skewed writes with an aggressive threshold: wear-leveling moves. */
+    g = GEOM_SMALL;
+    g.wl_threshold = 1;
+    exhaustive_hot_cold(&g, 20, 800, 0, 41);
+    g.policy = FKV_GC_COST_BENEFIT;
+    exhaustive_hot_cold(&g, 20, 800, 0, 42);
     report("single cut");
 }
 
 void test_powerloss_nested(void)
 {
     struct geom g = GEOM_SMALL;
-    for (uint64_t seed = 1; seed <= 3; seed++) {
+    for (uint64_t seed = 1; seed <= 4; seed++) {
         g.policy = (enum fkv_gc_policy)(seed % 2);
-        exhaustive(&g, 24, 200, 70, 4, 100 + seed);
+        g.wl_threshold = seed <= 2 ? 1 : 4;
+        if (seed <= 2)
+            exhaustive_hot_cold(&g, 20, 500, 4, 100 + seed);
+        else
+            exhaustive(&g, 24, 500, 60, 4, 100 + seed);
     }
     report("nested cuts");
 }
